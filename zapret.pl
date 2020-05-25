@@ -39,6 +39,9 @@ use constant
 	IP_TABLE => "zap2_ips",
 	IP_COL_NAME => "ip",
 
+	IP_CUSTOM_CONTENT => "zap2_ips_custom_contet_id",
+	IP_CUSTOM_CONTENT_COL_NAME => "ip",
+
 
 	IP_ONLY_TABLE => "zap2_only_ips",
 	IP_ONLY_COL_NAME => "ip",
@@ -49,14 +52,19 @@ use constant
 	SUBNET_TABLE => "zap2_subnets",
 	SUBNET_COL_NAME => "subnet",
 
-	SUPPORTED_DUMP_VERSION => 2.4
+	SUPPORTED_DUMP_VERSION => 2.4,
+
+	CONTENT_TABLE => "zap2_content_id",
+	CONTENT_IP_TABLE => "zap2_content_ip_id",
+	CONTENT_IP_COL_NAME => "ip"
 };
 
 
 
 ######## Config #########
 
-my $openssl_bin_path="/usr/local/gost-ssl-new/bin";
+#my $openssl_bin_path="/usr/local/gost-ssl-new/bin";
+my $openssl_bin_path="/usr/local/bin";
 
 my $dir = File::Basename::dirname($0);
 my $Config = {};
@@ -200,7 +208,7 @@ my $mail_add_content_skipped = 0;
 my $mail_del_content_skipped = 0;
 
 my %all_records; # $all_records{$ips->{decision_id}} = $ips->{id};
-
+my %custom_content;
 $logger->debug("Last dump date:\t".$lastDumpDateOld);
 $logger->debug("Last action:\t".$lastAction);
 $logger->debug("Last code:\t".$lastCode);
@@ -220,15 +228,19 @@ eval
 	{
 		sendRequest();
 		my $files = getDumpFile(getResult($lastCode));
+		$logger->info("Get Dump at ".(localtime()));
 		getAllContent();
+		$logger->info("Get getAllContent at ".(localtime()));
 		parseFiles($files);
 		parseOurBlacklist($our_blacklist) if($our_blacklist);
+		$logger->info("parseFiles at ".(localtime()));
 		analyzeOldContent();
 		$register_processed = 1;
 		setParam('lastActionDate', time);
-	} else {
-		parseOurBlacklist($our_blacklist) if($our_blacklist);
 	}
+	# else {
+	#	parseOurBlacklist($our_blacklist) if($our_blacklist);
+	#}
 };
 if($@)
 {
@@ -674,6 +686,32 @@ sub getData
 	return @values;
 }
 
+sub getCustomContenID
+{
+	my $table = shift;
+	my $name = shift;
+	my %values;
+	my $sth = $DBH->prepare("SELECT * FROM $table");
+	$sth->execute or die DBI->errstr;
+	while(my $ips = $sth->fetchrow_hashref())
+	{
+		my $value = $ips->{$name} || "";
+		if($value)
+		{
+			#print ($value."\n");
+			$values{$value} = $ips->{id};
+		}
+	}
+	$sth->finish();
+	#foreach my $k (keys %values){
+	#print "$k = $values{$k}\n";
+	#}
+	#print Dumper(%values);
+	return %values;
+}
+
+
+
 sub getContentByID
 {
 	my $id = shift;
@@ -707,6 +745,11 @@ sub getContentByID
 		if(@only_ips)
 		{
 			$content{only_ip} = \@only_ips;
+		}
+		my @custom_content_ips = getData($id, IP_CUSTOM_CONTENT, IP_CUSTOM_CONTENT_COL_NAME);
+		if(@custom_content_ips)
+		{
+			$content{custom_content_ips} = \@custom_content_ips;
 		}
 		$content{hash} = $ips->{hash} || undef;
 		$content{id} = $ips->{id};
@@ -785,6 +828,18 @@ sub insertEntry
 	$sth->execute();
 }
 
+sub insertduplEntry
+{
+	my $table = shift;
+	my $col_name = shift;
+	my $record_id = shift;
+	my $value = shift;
+	my $sth = $DBH->prepare("INSERT INTO $table (record_id, $col_name) VALUES(?,?) ON DUPLICATE KEY UPDATE date_add=CURRENT_TIMESTAMP");
+	$sth->bind_param(1, $record_id);
+	$sth->bind_param(2, $value);
+	$sth->execute();
+}
+
 sub removeEntry
 {
 	my $table = shift;
@@ -827,12 +882,27 @@ sub removeOldURL
 		if(exists $del_url->{id})
 		{
 			$logger->debug("Removing URL ".$del_url->{value}." (id ".$del_url->{id}.")");
+			insertdiff("Url",$del_url->{value},"del");
 			mail_del_url($del_url->{value}, $db_content->{decision_id});
 			removeEntry(URL_TABLE, $del_url->{id});
 			$deleted_old_urls++;
 		}
 	}
 }
+
+sub insertdiff
+{
+       my $type = shift;
+       my $content = shift;
+       my $action = shift;
+       my $sth = $DBH->prepare("INSERT INTO diff (type,content,action,date) VALUES(?,?,?,NOW())");
+       $sth->bind_param(1,$type);
+       $sth->bind_param(2,$content);
+       $sth->bind_param(3,$action);
+       $sth->execute();
+       return $sth->{mysql_insertid};
+}
+
 
 sub processURL
 {
@@ -851,6 +921,7 @@ sub processURL
 				mail_add_url($url, $db_content->{decision_id});
 #				$MAIL_ADDED .= "Added new URL: ".$url." for $db_content{decision_id} \n";
 				$logger->debug("Added new URL: ".$url);
+				insertdiff("Url",$url,"add");
 				$added_urls++;
 			}
 		}
@@ -866,6 +937,7 @@ sub removeOldIP
 		if(exists $del_ip->{id})
 		{
 			$logger->debug("Removing IP ".$del_ip->{value}." (id ".$del_ip->{id}.")");
+			insertdiff("IP",$del_ip->{value},"del");
 			mail_del_ip($del_ip->{value}, $db_content->{decision_id});
 			removeEntry(IP_TABLE, $del_ip->{id});
 			$deleted_old_ips++;
@@ -881,6 +953,7 @@ sub removeOldSubnet
 		if(exists $del_subnet->{id})
 		{
 			$logger->debug("Removing subnet ".$del_subnet->{value}." (id ".$del_subnet->{id}.")");
+			insertdiff("Subnet",$del_subnet->{value},"del");
 			mail_del_subnet($del_subnet->{value}, $db_content->{decision_id});
 			removeEntry(SUBNET_TABLE, $del_subnet->{id});
 			$deleted_old_subnets++;
@@ -896,6 +969,7 @@ sub removeOldDomain
 		if(exists $del_domain->{id})
 		{
 			$logger->debug("Removing Domain ".$del_domain->{value}." (id ".$del_domain->{id}.")");
+			insertdiff("Domain",$del_domain->{value},"del");
 			mail_del_domain($del_domain->{value}, $db_content->{decision_id});
 			removeEntry(DOMAIN_TABLE, $del_domain->{id});
 			$deleted_old_domains++;
@@ -911,6 +985,7 @@ sub removeOldOnlyIP
 		if(exists $del_ip->{id})
 		{
 			$logger->debug("Removing Only IP ".$del_ip->{value}." (id ".$del_ip->{id}.")");
+			insertdiff("OnlyIP",$del_ip->{value},"del");
 			mail_del_only_ip($del_ip->{value}, $db_content->{decision_id});
 			removeEntry(IP_ONLY_TABLE, $del_ip->{id});
 			$deleted_old_only_ips++;
@@ -958,6 +1033,7 @@ sub processIP
 				insertEntry(IP_TABLE, IP_COL_NAME, $record_id, $ip_packed);
 				mail_add_ip($ip, $db_content->{decision_id});
 				$logger->debug("Added new IP: ".$ip);
+				insertdiff("IP",$ip,"add");
 				if($ipa->version() == 4)
 				{
 					$added_ipv4_ips++;
@@ -968,6 +1044,44 @@ sub processIP
 		}
 #		print "in the ips add array: ", Dumper(\@add_ips), "\n";
 	}
+}
+
+sub processIPfromCustomContentID
+{
+	my $content = shift;
+	my $db_content = shift;
+	my $record_id = $content->{id};
+	my @ips;
+	push(@ips, @{$content->{ip}{value}}) if(defined $content->{ip}{value});
+	if(defined $content->{ipv6}{value})
+	{
+		my @ipv6 = @{$content->{ipv6}{value}};
+		convertIPv6(\@ipv6);
+		push(@ips, @ipv6);
+	}
+	if(@ips)
+	{
+		my @add_ips = checkData(\@ips, $db_content->{custom_content_ips});
+		if(@add_ips)
+		{
+		foreach my $ip (@add_ips)
+		{
+			my $ipa = new Net::IP($ip);
+			my $ip_packed=pack("B*",$ipa->binip());
+			insertduplEntry("zap2_ips_custom_contet_id", IP_COL_NAME, $record_id, $ip_packed);
+			mail_add_ip($ip, $content->{id});
+			$logger->debug("Added new IP: ".$ip);
+			insertdiff("IP_from_conten_id",$ip,"add");
+			if($ipa->version() == 4)
+			{
+				$added_ipv4_ips++;
+			} else {
+				$added_ipv6_ips++;
+			}
+		}
+		}
+	}
+#		print "in the ips add array: ", Dumper(\@add_ips), "\n";
 }
 
 sub processDomain
@@ -986,6 +1100,7 @@ sub processDomain
 				insertEntry(DOMAIN_TABLE, DOMAIN_COL_NAME, $record_id, $domain);
 				mail_add_domain($domain, $db_content->{decision_id});
 				$logger->debug("Added new Domain: ".$domain);
+				insertdiff("Domain",$domain,"add");
 				$added_domains++;
 			}
 		}
@@ -1018,6 +1133,7 @@ sub processOnlyIP
 				insertEntry(IP_ONLY_TABLE, IP_ONLY_COL_NAME, $record_id, $ip_packed);
 				mail_add_only_ip($ip, $db_content->{decision_id});
 				$logger->debug("Added new only IP: ".$ip);
+				insertdiff("OnlyIP",$ip,"add");
 				if($ipa->version() == 4)
 				{
 					$added_only_ipv4_ips++;
@@ -1046,6 +1162,7 @@ sub processSubnet
 			foreach my $subnet (@add_subnets)
 			{
 				insertEntry(SUBNET_TABLE, SUBNET_COL_NAME, $record_id, $subnet);
+				insertdiff("Subnet",$subnet,"add");
 				mail_add_subnet($subnet, $db_content->{decision_id});
 				$logger->debug("Added new subnet: ".$subnet);
 				$added_subnets++;
@@ -1094,10 +1211,6 @@ sub processContent
 		{
 			processOnlyIP($content, $db_content);
 		}
-		if(defined $content->{ipSubnet}{value} || defined $content->{ipv6Subnet}{value})
-		{
-			processSubnet($content, $db_content);
-		}
 	} else {
 		if($content->{blockType} eq "domain" || $content->{blockType} eq "domain-mask")
 		{
@@ -1131,6 +1244,15 @@ sub processContent
 			$logger->error("Unknown blockType in content id ".$content->{id});
 		}
 	}
+	if (exists $custom_content{$content->{id}})
+	{
+		if (defined $content->{ip}{value})
+		{
+		processIPfromCustomContentID($content, $db_content)
+		}
+	print ("Find content id\n");
+	}
+
 	if(defined $db_content->{url})
 	{
 		removeOldURL($db_content);
@@ -1156,6 +1278,8 @@ sub parseContent
 {
 	my $content = shift;
 	$content->{blockType} = 'default' if(!exists $content->{blockType});
+	
+	
 	if(exists $all_records{$content->{id}})
 	{
 		if(!defined $all_records{$content->{id}}{hash} || $all_records{$content->{id}}{hash} ne $content->{hash})
@@ -1210,6 +1334,10 @@ sub analyzeOldContent
 
 sub parseDump
 {
+	#print("CUSTOM CONTENT\n");
+	%custom_content = getCustomContenID("zap2_content_id","content_id");
+	#print Dumper(%custom_content);
+	
 	my $xml_file = shift;
 	my $reader = XML::LibXML::Reader->new(location => $xml_file) or die "Can't process xml file '$xml_file': ".$!."\n";
 	my $do_content = 0;
